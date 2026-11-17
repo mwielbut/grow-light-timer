@@ -1,140 +1,257 @@
+// Grow Light Timer
+//
+// Switches an AC grow light on/off on a daily schedule using an Adafruit
+// Power Relay FeatherWing. Time comes from NTP; the schedule is set from a
+// small web page (http://growlight.local) and persisted in flash.
 
-
+#include <Arduino.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <WiFi.h>
+#include <time.h>
+
+#include "Schedule.h"
+#include "config.h"
 #include "credentials.h"
+#include "web_page.h"
 
-// Pin definitions
-#define RELAY_PIN 27
+static const unsigned long CONTROL_INTERVAL_MS = 1000;
+static const unsigned long WIFI_RETRY_MS = 30000;
+static const time_t MIN_VALID_EPOCH = 1700000000; // Nov 2023: clock has been set
 
-// Target server to check internet connectivity
-const char *host = "google.com";
-const uint16_t port = 80;
+WebServer server(80);
+Preferences prefs;
 
-// Timing intervals (in milliseconds)
-const long checkInterval = 86400000;  // check every 24 hours
-const long requestTimeout = 10000; // expect a response within 10 seconds
-const long resetTime = 10000;      // turn off the relay after 10 seconds
-const long modemBootTime = 600000;   // wait 10 minutes for the modem to boot up
+Schedule schedule;
+LightController controller;
+bool lightOn = false;
+bool timeSynced = false;
+bool mdnsStarted = false;
 
-// Variables to track timing
-unsigned long previousMillis = 0;
+// ---------------------------------------------------------------- schedule
 
-void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info)
+void loadSchedule()
 {
-  Serial.println("Event: WIFI_STA_CONNECTED");
+  uint16_t defOn = 0, defOff = 0;
+  parseTime(DEFAULT_ON_TIME, defOn);
+  parseTime(DEFAULT_OFF_TIME, defOff);
+
+  prefs.begin("growlight", true);
+  schedule.onMinute = prefs.getUShort("on", defOn);
+  schedule.offMinute = prefs.getUShort("off", defOff);
+  prefs.end();
+
+  // Guard against corrupted values
+  if (schedule.onMinute >= MINUTES_PER_DAY)
+    schedule.onMinute = defOn;
+  if (schedule.offMinute >= MINUTES_PER_DAY)
+    schedule.offMinute = defOff;
 }
 
-void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info)
+void saveSchedule()
 {
-  Serial.println("Event: WIFI_STA_GOT_IP");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  prefs.begin("growlight", false);
+  prefs.putUShort("on", schedule.onMinute);
+  prefs.putUShort("off", schedule.offMinute);
+  prefs.end();
 }
 
-void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info)
+// ------------------------------------------------------------------ relay
+
+void setLight(bool on)
 {
-  Serial.println("Event: WIFI_STA_DISCONNECTED");
-  Serial.print("WiFi lost connection. Reason: ");
-  Serial.println(info.wifi_sta_disconnected.reason);
-  Serial.println("Trying to reconnect...");
-  WiFi.begin(ssid, password);
+  if (on == lightOn)
+    return;
+  lightOn = on;
+  digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+  digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
+  Serial.printf("Light %s\n", on ? "ON" : "OFF");
 }
+
+bool currentMinuteOfDay(uint16_t &minuteOfDay)
+{
+  time_t now = time(nullptr);
+  if (now < MIN_VALID_EPOCH)
+    return false;
+
+  struct tm local;
+  localtime_r(&now, &local);
+  minuteOfDay = local.tm_hour * 60 + local.tm_min;
+  return true;
+}
+
+void updateLight()
+{
+  uint16_t minute;
+  if (!currentMinuteOfDay(minute))
+  {
+    // No valid time yet (just powered up, no NTP): the schedule can't run, so
+    // keep the light off unless it was switched on manually.
+    setLight(controller.overrideActive() && controller.overrideOn());
+    return;
+  }
+
+  if (!timeSynced)
+  {
+    timeSynced = true;
+    Serial.println("Time synced");
+  }
+
+  setLight(controller.update(scheduledOn(schedule, minute)));
+}
+
+// -------------------------------------------------------------------- web
+
+void sendStatus()
+{
+  char onBuf[6], offBuf[6], nowBuf[32] = "";
+  formatTime(schedule.onMinute, onBuf);
+  formatTime(schedule.offMinute, offBuf);
+
+  if (timeSynced)
+  {
+    time_t now = time(nullptr);
+    struct tm local;
+    localtime_r(&now, &local);
+    strftime(nowBuf, sizeof(nowBuf), "%a %b %d %I:%M %p %Z", &local);
+  }
+
+  char json[256];
+  snprintf(json, sizeof(json),
+           "{\"on\":%s,\"override\":%s,\"synced\":%s,\"onTime\":\"%s\",\"offTime\":\"%s\",\"now\":\"%s\"}",
+           lightOn ? "true" : "false",
+           controller.overrideActive() ? "true" : "false",
+           timeSynced ? "true" : "false",
+           onBuf, offBuf, nowBuf);
+  server.send(200, "application/json", json);
+}
+
+void handleSchedule()
+{
+  uint16_t on, off;
+  if (!parseTime(server.arg("onTime").c_str(), on) ||
+      !parseTime(server.arg("offTime").c_str(), off))
+  {
+    server.send(400, "text/plain", "Times must be HH:MM (24h)");
+    return;
+  }
+  if (on == off)
+  {
+    server.send(400, "text/plain", "On and off times must differ");
+    return;
+  }
+
+  schedule.onMinute = on;
+  schedule.offMinute = off;
+  saveSchedule();
+  controller.clearOverride();
+  updateLight();
+
+  Serial.printf("Schedule set: on %s, off %s\n",
+                server.arg("onTime").c_str(), server.arg("offTime").c_str());
+  sendStatus();
+}
+
+void handleOverride()
+{
+  String state = server.arg("state");
+  if (state == "on")
+    controller.setOverride(true);
+  else if (state == "off")
+    controller.setOverride(false);
+  else if (state == "clear")
+    controller.clearOverride();
+  else
+  {
+    server.send(400, "text/plain", "state must be on, off or clear");
+    return;
+  }
+
+  updateLight();
+  Serial.printf("Override: %s\n", state.c_str());
+  sendStatus();
+}
+
+void setupWebServer()
+{
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/api/status", HTTP_GET, sendStatus);
+  server.on("/api/schedule", HTTP_POST, handleSchedule);
+  server.on("/api/override", HTTP_POST, handleOverride);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+}
+
+// ------------------------------------------------------------------- wifi
+
+void maintainWiFi()
+{
+  static unsigned long lastAttempt = 0;
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    if (!mdnsStarted && MDNS.begin(HOSTNAME))
+    {
+      MDNS.addService("http", "tcp", 80);
+      mdnsStarted = true;
+      Serial.printf("Web UI: http://%s.local (http://%s)\n", HOSTNAME,
+                    WiFi.localIP().toString().c_str());
+    }
+    return;
+  }
+
+  // The schedule keeps running from the internal clock while offline.
+  if (millis() - lastAttempt >= WIFI_RETRY_MS)
+  {
+    lastAttempt = millis();
+    Serial.println("WiFi disconnected, reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+}
+
+// ------------------------------------------------------------------- main
 
 void setup()
 {
-  Serial.begin(115200);
-  while (!Serial)
-    ; // Needed for some boards
-
-  delay(1000);
-
-  // initialize LED digital pin as an output
-  pinMode(LED_BUILTIN, OUTPUT);
-  // initialize relay digital pin as an output
+  // Relay off immediately at boot so the light never flickers on.
   pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
-  // delete old config
-  WiFi.disconnect(true);
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\nGrow Light Timer starting");
 
-  delay(1000);
+  loadSchedule();
+  char onBuf[6], offBuf[6];
+  formatTime(schedule.onMinute, onBuf);
+  formatTime(schedule.offMinute, offBuf);
+  Serial.printf("Schedule: on %s, off %s\n", onBuf, offBuf);
 
-  WiFi.onEvent(WiFiStationConnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_CONNECTED);
-  WiFi.onEvent(WiFiGotIP, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_GOT_IP);
-  WiFi.onEvent(WiFiStationDisconnected, WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
 
-  Serial.println();
-  Serial.println();
+  // SNTP runs in the background and resyncs periodically.
+  configTzTime(TIMEZONE, NTP_SERVER_1, NTP_SERVER_2);
+
+  setupWebServer();
 }
 
 void loop()
 {
+  static unsigned long lastControl = 0;
 
-  unsigned long currentMillis = millis();
+  server.handleClient();
+  maintainWiFi();
 
-  // Check if 30 seconds have passed
-  if (currentMillis - previousMillis >= checkInterval)
+  if (millis() - lastControl >= CONTROL_INTERVAL_MS)
   {
-    previousMillis = currentMillis;
-
-    Serial.print("Checking WiFi connection to (");
-    Serial.print(ssid);
-    Serial.println(")");
-    if (WiFi.status() != WL_CONNECTED)
-    {
-      Serial.println("Unsuccessful. Gotta wait.");
-      return;
-    }
-    else
-    {
-      Serial.println("Success!");
-    }
-
-    Serial.print("Checking internet connectivity to (");
-    Serial.print(host);
-    Serial.print(":");
-    Serial.print(port);
-    Serial.println(")");
-
-    // Attempt to connect to an external host
-    WiFiClient client;
-    int connectionError = client.connect(host, port, requestTimeout);
-    if (connectionError == 0 && WiFi.status() == WL_CONNECTED)
-    {
-      Serial.println("Connection failed! Internet may be down or unstable.");
-
-      Serial.println("Turning on relay to reset modem...");
-      // turn on the relay and LED to indicate no internet
-
-      // turn on the relay to reset the modem
-      digitalWrite(RELAY_PIN, HIGH);
-
-      // wait for modem to reset
-      delay(resetTime);
-
-      // turn off the relay to restart the modem
-      digitalWrite(RELAY_PIN, LOW);
-
-      Serial.println("Relay turned off. Waiting for internet to stabilize...");
-
-      // wait for modem to start up
-      delay(modemBootTime);
-    }
-    else if (WiFi.status() != WL_CONNECTED)
-    {
-      Serial.println("WiFi not connected!");
-      client.stop(); // Close the connection immediately
-    }
-    else
-    {
-      Serial.println("Successfully connected to the internet!");
-      client.stop(); // Close the connection immediately
-    }
+    lastControl = millis();
+    updateLight();
   }
-
-  digitalWrite(LED_BUILTIN, HIGH);
-  delay(500);
-  digitalWrite(LED_BUILTIN, LOW);
-  delay(500);
 }
